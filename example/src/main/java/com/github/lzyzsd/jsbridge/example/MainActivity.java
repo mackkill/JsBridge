@@ -79,7 +79,9 @@ public class MainActivity extends Activity implements OnClickListener {
 
 		webView.addJavascriptInterface(new MainJavascriptInterface(webView.getCallbacks(), webView.getPersistentCallbacks(), webView), "WebViewJavascriptBridge");
 		webView.setGson(new Gson());
-		webView.loadUrl("file:///android_asset/demo.html");
+//		webView.loadUrl("http://10.12.110.251/h5-ios/login");
+		webView.loadUrl("https://www.baidu.com");
+//		webView.loadUrl("file:///android_asset/demo.html");
         User user = new User();
         Location location = new Location();
         location.address = "SDU";
