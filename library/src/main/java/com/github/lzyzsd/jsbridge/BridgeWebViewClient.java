@@ -5,21 +5,19 @@ import android.net.http.SslError;
 import android.os.Build;
 import androidx.annotation.Nullable;
 
-import android.util.Log;
 import android.view.KeyEvent;
 import android.webkit.ClientCertRequest;
 import android.webkit.HttpAuthHandler;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.SafeBrowsingResponse;
 import android.webkit.SslErrorHandler;
+import android.webkit.ValueCallback;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
-import java.io.UnsupportedEncodingException;
-import java.net.URLDecoder;
 
 /**
  * 如果要自定义WebViewClient必须要集成此类
@@ -32,6 +30,9 @@ class BridgeWebViewClient extends WebViewClient {
 
     private WebViewClient mClient;
 
+    /** Guard against duplicate injection within the same page load. */
+    private boolean mInjecting = false;
+
     public BridgeWebViewClient(OnLoadJSListener listener) {
         mListener = listener;
     }
@@ -42,22 +43,37 @@ class BridgeWebViewClient extends WebViewClient {
 
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, String url) {
+        // Bridge interception must run first, regardless of custom client
+        if (interceptUrl(url)) {
+            return true;
+        }
         if (mClient != null) {
             return mClient.shouldOverrideUrlLoading(view, url);
         }
-        return interceptUrl(url) ? true : super.shouldOverrideUrlLoading(view, url);
+        return super.shouldOverrideUrlLoading(view, url);
+    }
+
+    @Override
+    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            String url = request.getUrl().toString();
+            if (interceptUrl(url)) {
+                return true;
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && mClient != null) {
+            return mClient.shouldOverrideUrlLoading(view, request);
+        }
+        return super.shouldOverrideUrlLoading(view, request);
     }
 
     private boolean interceptUrl(String url) {
-        try {
-            url = URLDecoder.decode(url, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            e.printStackTrace();
-        }
-        Log.i(TAG, "shouldOverrideUrlLoading, url = " + url);
-        if (url.startsWith(BridgeUtil.YY_RETURN_DATA)) { // 如果是返回数据
+        // Only check the raw URL prefix — bridge URLs (yy://) are never percent-encoded,
+        // so there is no need to decode. Decoding non-bridge URLs can corrupt their query
+        // parameters (e.g. %3d → = changes parameter boundaries). See issue #175.
+        if (url.startsWith(BridgeUtil.YY_RETURN_DATA)) {
             return true;
-        } else if (url.startsWith(BridgeUtil.YY_OVERRIDE_SCHEMA)) { //
+        } else if (url.startsWith(BridgeUtil.YY_OVERRIDE_SCHEMA)) {
             return true;
         }
         return false;
@@ -70,7 +86,9 @@ class BridgeWebViewClient extends WebViewClient {
         } else {
             super.onPageStarted(view, url, favicon);
         }
-
+        // Reset injection state for new page load
+        mInjecting = false;
+        mListener.onPageReset();
     }
 
     @Override
@@ -80,9 +98,29 @@ class BridgeWebViewClient extends WebViewClient {
         } else {
             super.onPageFinished(view, url);
         }
-        mListener.onLoadStart();
-        BridgeUtil.webViewLoadLocalJs(view, BridgeUtil.JAVA_SCRIPT);
-        mListener.onLoadFinished();
+
+        // Guard: only inject once per page load (onPageFinished can fire multiple times)
+        if (mInjecting) {
+            return;
+        }
+        mInjecting = true;
+
+        String jsContent = BridgeUtil.assetFile2Str(view.getContext(), BridgeUtil.JAVA_SCRIPT);
+        if (jsContent != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            // evaluateJavascript guarantees the callback fires after JS execution completes
+            view.evaluateJavascript(jsContent, new ValueCallback<String>() {
+                @Override
+                public void onReceiveValue(String value) {
+                    mListener.onJSInjected();
+                }
+            });
+        } else {
+            // Fallback for API < 19: loadUrl is async but we have no completion signal
+            if (jsContent != null) {
+                view.loadUrl("javascript:" + jsContent);
+            }
+            mListener.onJSInjected();
+        }
     }
 
     @Override
@@ -259,9 +297,11 @@ class BridgeWebViewClient extends WebViewClient {
 
     public interface OnLoadJSListener {
 
-        void onLoadStart();
+        /** Called when a new page starts loading. Reset injection state and restore message queue. */
+        void onPageReset();
 
-        void onLoadFinished();
+        /** Called after the bridge JS has been confirmed injected. Flush queued messages. */
+        void onJSInjected();
 
     }
 }
